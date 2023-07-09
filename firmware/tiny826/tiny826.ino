@@ -3,7 +3,7 @@
 
 #include <Wire.h>
 #include <EEPROM.h>
-#include <avr/pgmspace.h> 
+#include <avr/wdt.h>
 
 // ATTiny826 本体のアドレス
 #define I2C_SLAVE_ADD 0x30
@@ -130,7 +130,6 @@ void requestEvent() {
     int i, f;
     uint8_t cmd = cmd_buf[0];
     
-    
     if (cmd == 0x01) {
       // 現在の設定と比較して違えば更新
       f = 0;
@@ -140,15 +139,13 @@ void requestEvent() {
       if (f) {
         // 設定を変更
         for (i=0; i<18; i++) {
-          setting_data[i] = cmd_buf[i+1];
           EEPROM.write(i+1, cmd_buf[i+1]);
         }
-        // ピンの設定情報を変数に格納
-        set_pin_data();
         // 設定変更があれば2を返す
         Wire.write(0x02);
         Wire.write(cmd_buf[1]);
-        // このあと再起動処理をしたいけど書き方が分からず
+        // 60ミリ秒後に再起動
+        wdt_enable(WDTO_60MS);
       } else {
         // 設定変更が無ければ1を返す
         Wire.write(0x01);
@@ -162,32 +159,15 @@ void requestEvent() {
         }
 
     } else if (cmd == 0x03) {
-        // キー入力の取得
+        // 読み込むキーの数とバイト数を取得
+        Wire.write(key_len);
+        Wire.write(send_byte);
+
+    } else if (cmd == 0x04) {
+        // キー入力情報を取得
         for (i=0; i<send_byte; i++) {
             Wire.write(send_buf[i]);
         }
-
-    } else if (cmd == 0x04) {
-        Wire.write(direct_len);
-        for (i=0; i<direct_len; i++) {
-            Wire.write(direct_list[i]);
-        }
-
-    } else if (cmd == 0x05) {
-        Wire.write(col_len);
-        for (i=0; i<col_len; i++) {
-            Wire.write(col_list[i]);
-        }
-
-    } else if (cmd == 0x06) {
-        Wire.write(row_len);
-        for (i=0; i<row_len; i++) {
-            Wire.write(row_list[i]);
-        }
-
-    } else if (cmd == 0x07) {
-        Wire.write(key_len);
-        Wire.write(send_byte);
 
     } else {
       // 不明なコマンドの場合は自分のアドレスをエコーする
