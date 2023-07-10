@@ -26,17 +26,24 @@ const uint8_t pin_num[16] = {
   PIN_PA0, PIN_PA1, PIN_PA2, PIN_PA3
 };
 
+// ロータリーエンコーダカウント用
+const short rotary_qem[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
+
+
 uint8_t read_buf[16]; // キーの読み込みバッファ
 uint8_t send_buf[16]; // キー送信用のデータ
 uint8_t send_byte; // キー送信に何バイト送信するか
 uint8_t direct_list[16]; // ダイレクトピンリスト
 uint8_t col_list[16]; // colピンリスト
 uint8_t row_list[16]; // rowピンリスト
+uint8_t rotary_list[16]; // ロータリーエンコーダのピン(A,A,B,B,C,C....H,H)
 uint8_t key_len; // 読み込むキーの数
 uint8_t direct_len; // ダイレクトピンの数
 uint8_t col_len; // colピンの数
 uint8_t row_len; // rowピンの数
 uint8_t req_cmd; // 要求されたコマンド
+uint8_t rotary_read[8]; // ロータリーエンコーダの読み込みデータ
+short rotary_count[8]; // ロータリーエンコーダの動作カウント
 // 0.本体アドレス1バイト、1.読み込みモード1バイト(0=通常マトリックス、1=倍マトリックス)、2～17.全ピンの設定16バイト(0=未使用、1=ダイレクト、2=COL、3=ROW)
 uint8_t setting_data[18] = {
   I2C_SLAVE_ADD, 0x00,
@@ -48,14 +55,84 @@ uint8_t cmd_buf[CMD_BUF_SIZE];
 void receiveEvent(int data_len); // データを受け取った
 void requestEvent(); // データ要求を受け取った
 
+// ロータリーエンコーダの読み込み
+void read_rotary(int p) {
+  int rotary_num = p / 2;
+  uint8_t n = (digitalRead(rotary_list[p]) * 2) + digitalRead(rotary_list[p+1]); // 現在の状態取得
+  uint8_t s = (rotary_read[rotary_num] * 4) + n; // 前回の状態と結合
+  if (s < 16) rotary_count[rotary_num] += rotary_qem[s]; // 前回今回の状態を元にカウント計算
+  rotary_read[rotary_num] = n; // 今回の状態を保持
+}
+
+// ロータリーエンコーダ割り込みアタッチ用関数
+void read_rotary_a() { read_rotary(0); }
+void read_rotary_b() { read_rotary(2); }
+void read_rotary_c() { read_rotary(4); }
+void read_rotary_d() { read_rotary(6); }
+void read_rotary_e() { read_rotary(8); }
+void read_rotary_f() { read_rotary(10); }
+void read_rotary_g() { read_rotary(12); }
+void read_rotary_h() { read_rotary(14); }
+
+// ロータリーエンコーダの割り込みイベント登録
+int attach_rotary(int p, uint8_t pin_i) {
+  // 既に設定し終わっていたら無視
+  if (rotary_list[p] != 0xFF && rotary_list[p+1] != 0xFF) {
+    return 0;
+  }
+  // ここでピンモード設定しちゃう
+  pinMode(pin_num[pin_i], INPUT_PULLUP);
+  // 1つ目だけならピン番号格納して終わり
+  if (rotary_list[p] == 0xFF) {
+    rotary_list[p] = pin_num[pin_i];
+    return 0;
+  }
+  // 2つ目ならば割り込みイベント登録
+  rotary_list[p+1] = pin_num[pin_i]; // ピン番号保持
+  // 現在のピンの状態を読み込んでおく
+  rotary_read[(p / 2)] = (digitalRead(rotary_list[p]) << 1) + digitalRead(rotary_list[p+1]);
+  // イベント登録
+  int pin_a = digitalPinToInterrupt(rotary_list[p]);
+  int pin_b = digitalPinToInterrupt(rotary_list[p+1]);
+  if (p < 2) {
+    attachInterrupt(pin_a, read_rotary_a, CHANGE);
+    attachInterrupt(pin_b, read_rotary_a, CHANGE);
+  } else if (p < 4) {
+    attachInterrupt(pin_a, read_rotary_b, CHANGE);
+    attachInterrupt(pin_b, read_rotary_b, CHANGE);
+  } else if (p < 6) {
+    attachInterrupt(pin_a, read_rotary_c, CHANGE);
+    attachInterrupt(pin_b, read_rotary_c, CHANGE);
+  } else if (p < 8) {
+    attachInterrupt(pin_a, read_rotary_d, CHANGE);
+    attachInterrupt(pin_b, read_rotary_d, CHANGE);
+  } else if (p < 10) {
+    attachInterrupt(pin_a, read_rotary_e, CHANGE);
+    attachInterrupt(pin_b, read_rotary_e, CHANGE);
+  } else if (p < 12) {
+    attachInterrupt(pin_a, read_rotary_f, CHANGE);
+    attachInterrupt(pin_b, read_rotary_f, CHANGE);
+  } else if (p < 14) {
+    attachInterrupt(pin_a, read_rotary_g, CHANGE);
+    attachInterrupt(pin_b, read_rotary_g, CHANGE);
+  } else if (p < 16) {
+    attachInterrupt(pin_a, read_rotary_h, CHANGE);
+    attachInterrupt(pin_b, read_rotary_h, CHANGE);
+  }
+  return 2;
+}
+
+
 // ピンの設定情報を変数に格納
 void set_pin_data() {
   int i, p;
+  int rc = 0;
 
   // 設定データクリア
   memset(direct_list, 0, sizeof(direct_list));
   memset(col_list, 0, sizeof(col_list));
   memset(row_list, 0, sizeof(row_list));
+  memset(rotary_list, 0xFF, sizeof(rotary_list));
   direct_len = 0;
   col_len = 0;
   row_len = 0;
@@ -63,26 +140,43 @@ void set_pin_data() {
   // ピン情報を変数に格納
   for (i=0; i<16; i++) {
     p = setting_data[i+2];
-    if (p == 1) {
+    if (p == 1) { // ダイレクト
       direct_list[direct_len] = pin_num[i];
       direct_len++;
-    } else if (p == 2) {
+    } else if (p == 2) { // COL
       col_list[col_len] = pin_num[i];
       col_len++;
-    } else if (p == 3) {
+    } else if (p == 3) { // ROW
       row_list[row_len] = pin_num[i];
       row_len++;
+    } else if (p == 4) { // ロータリーA
+      rc += attach_rotary(0, i);
+    } else if (p == 5) { // ロータリーB
+      rc += attach_rotary(2, i);
+    } else if (p == 6) { // ロータリーC
+      rc += attach_rotary(4, i);
+    } else if (p == 7) { // ロータリーD
+      rc += attach_rotary(6, i);
+    } else if (p == 8) { // ロータリーE
+      rc += attach_rotary(8, i);
+    } else if (p == 9) { // ロータリーF
+      rc += attach_rotary(10, i);
+    } else if (p == 10) { // ロータリーG
+      rc += attach_rotary(12, i);
+    } else if (p == 11) { // ロータリーH
+      rc += attach_rotary(14, i);
     }
   }
 
   // 読み込むキー数を計算
-  key_len = direct_len + (col_len * row_len);
-  if (setting_data[1] == 1) key_len = direct_len + (col_len * row_len * 2);
+  key_len = direct_len + (col_len * row_len) + rc;
+  if (setting_data[1] == 1) key_len = direct_len + (col_len * row_len * 2) + rc;
 
   // キーデータを送信する時に送るバイト数計算
   send_byte = key_len / 8;
   if (key_len % 8) send_byte++;
 }
+
 
 void setup() {
     uint8_t c;
@@ -108,6 +202,8 @@ void setup() {
     // バッファクリア
     memset(read_buf, 0, sizeof(read_buf));
     memset(send_buf, 0, sizeof(send_buf));
+    memset(rotary_read, 0, sizeof(rotary_read));
+    memset(rotary_count, 0, sizeof(rotary_count));
 
     // I2C スレーブ初期化
     Wire.begin(setting_data[0]); // I2C初期化、アドレスは設定されたアドレス
@@ -167,6 +263,10 @@ void requestEvent() {
         // キー入力情報を取得
         for (i=0; i<send_byte; i++) {
             Wire.write(send_buf[i]);
+        }
+        // 一度読み込まれたらロータリーエンコーダの回したデータクリア
+        for (i=0; i<8; i++) {
+          rotary_count[i] = 0;
         }
 
     } else {
@@ -235,6 +335,19 @@ void loop() {
         if (!digitalRead(col_list[j])) set_read_buf(r);
         r++;
       }
+    }
+  }
+
+  // ロータリーエンコーダ読み込み
+  for (i=0; i<16; i+=2) {
+    if (rotary_list[i] != 0xFF && rotary_list[i+1] != 0xFF) {
+      t = i / 2;
+      if (rotary_count[t] < 0) {
+        set_read_buf(r);
+      } else if (rotary_count[t] > 0) {
+        set_read_buf(r+1);
+      }
+      r += 2;
     }
   }
 
