@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <EEPROM.h>
 #include <avr/wdt.h>
+#include <tinyNeoPixel.h>
 
 // ATTiny826 本体のアドレス
 #define I2C_SLAVE_ADD 0x30
@@ -29,6 +30,18 @@ const uint8_t pin_num[16] = {
 // ロータリーエンコーダカウント用
 const short rotary_qem[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 
+// NeoPixcel の最大接続数
+#define NPX_MAX_LENGTH 128
+
+// NeoPixcelクラス
+tinyNeoPixel npx_obj;
+
+// NeoPixcel ピン
+short npx_pin = -1;
+
+// NeoPixcel 接続数
+uint8_t npx_count = 0;
+
 
 uint8_t read_buf[16]; // キーの読み込みバッファ
 uint8_t send_buf[16]; // キー送信用のデータ
@@ -44,9 +57,9 @@ uint8_t row_len; // rowピンの数
 uint8_t req_cmd; // 要求されたコマンド
 uint8_t rotary_read[8]; // ロータリーエンコーダの読み込みデータ
 short rotary_count[8]; // ロータリーエンコーダの動作カウント
-// 0.本体アドレス1バイト、1.読み込みモード1バイト(0=通常マトリックス、1=倍マトリックス)、2～17.全ピンの設定16バイト(0=未使用、1=ダイレクト、2=COL、3=ROW)
-uint8_t setting_data[18] = {
-  I2C_SLAVE_ADD, 0x00,
+// 0.本体アドレス1バイト、1.読み込みモード1バイト(0=通常マトリックス、1=倍マトリックス)、2. NeoPixcel の接続数、 3～18.全ピンの設定16バイト(0=未使用、1=ダイレクト、2=COL、3=ROW)
+uint8_t setting_data[19] = {
+  I2C_SLAVE_ADD, 0x00, 0x00,
   0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
 // 各コマンド用の受け取ったデータ
 uint8_t cmd_buf[CMD_BUF_SIZE];
@@ -136,10 +149,13 @@ void set_pin_data() {
   direct_len = 0;
   col_len = 0;
   row_len = 0;
+  npx_pin = -1;
+  npx_count = setting_data[2];
+  if (npx_count > NPX_MAX_LENGTH) npx_count = NPX_MAX_LENGTH;
   
   // ピン情報を変数に格納
   for (i=0; i<16; i++) {
-    p = setting_data[i+2];
+    p = setting_data[i+3];
     if (p == 1) { // ダイレクト
       direct_list[direct_len] = pin_num[i];
       direct_len++;
@@ -165,12 +181,14 @@ void set_pin_data() {
       rc += attach_rotary(12, i);
     } else if (p == 11) { // ロータリーH
       rc += attach_rotary(14, i);
+    } else if (p == 12) { // NeoPxcel
+      npx_pin = pin_num[i];
     }
   }
 
   // 読み込むキー数を計算
-  key_len = direct_len + (col_len * row_len) + rc;
-  if (setting_data[1] == 1) key_len = direct_len + (col_len * row_len * 2) + rc;
+  key_len = direct_len + (col_len * row_len) + rc; // 通常マトリックスの場合
+  if (setting_data[1] == 1) key_len = direct_len + (col_len * row_len * 2) + rc; // 倍マトリックスの場合
 
   // キーデータを送信する時に送るバイト数計算
   send_byte = key_len / 8;
@@ -184,15 +202,15 @@ void setup() {
 
     // 初めての起動の場合EPPROMにデフォルト設定を書き込む
     c = EEPROM.read(0); // 最初の0バイト目を読み込む
-    if (c != 0x20) {
-      EEPROM.write(0, 0x20); // 初期化したよを書き込む
-      for (i=0; i<18; i++) {
+    if (c != 0x22) {
+      EEPROM.write(0, 0x22); // 初期化したよを書き込む
+      for (i=0; i<19; i++) {
         EEPROM.write(i+1, setting_data[i]); // デフォルトの設定データ書込み
       }
     }
 
     // EEPROMから設定を読み込む
-    for (i=0; i<18; i++) {
+    for (i=0; i<19; i++) {
       setting_data[i] = EEPROM.read(i+1);
     }
 
@@ -204,6 +222,16 @@ void setup() {
     memset(send_buf, 0, sizeof(send_buf));
     memset(rotary_read, 0, sizeof(rotary_read));
     memset(rotary_count, 0, sizeof(rotary_count));
+
+    // NeoPixel が定義されていればNeoPixel初期化
+    if (npx_pin >= 0) {
+      npx_obj = tinyNeoPixel(npx_count, npx_pin, NEO_GRB + NEO_KHZ800);
+      npx_obj.begin();
+      for (i=0; i<npx_count; i++) {
+          npx_obj.setPixelColor(i, 0, 0, 0);
+      }
+      npx_obj.show();
+    }
 
     // I2C スレーブ初期化
     Wire.begin(setting_data[0]); // I2C初期化、アドレスは設定されたアドレス
@@ -223,18 +251,18 @@ void receiveEvent(int data_len) {
 
 // データ要求を受け取った
 void requestEvent() {
-    int i, f;
+    int c, i, f, p;
     uint8_t cmd = cmd_buf[0];
     
     if (cmd == 0x01) {
       // 現在の設定と比較して違えば更新
       f = 0;
-      for (i=0; i<18; i++) {
+      for (i=0; i<19; i++) {
         if (setting_data[i] != cmd_buf[i+1]) f++;
       }
       if (f) {
         // 設定を変更
-        for (i=0; i<18; i++) {
+        for (i=0; i<19; i++) {
           EEPROM.write(i+1, cmd_buf[i+1]);
         }
         // 設定変更があれば2を返す
@@ -250,7 +278,7 @@ void requestEvent() {
 
     } else if (cmd == 0x02) {
         // 設定内容の取得
-        for (i=0; i<18; i++) {
+        for (i=0; i<19; i++) {
             Wire.write(setting_data[i]);
         }
 
@@ -266,9 +294,42 @@ void requestEvent() {
         }
         // 一度読み込まれたらロータリーエンコーダの回したデータクリア
         for (i=0; i<8; i++) {
-          rotary_count[i] = 0;
+            rotary_count[i] = 0;
         }
 
+    } else if (cmd == 0x05 || cmd == 0x06) {
+        // NeoPixcel を全部同じ色に光らせる(0x05 = データ書き換えだけ, 0x06 = 光らせる処理も実行)
+        if (npx_pin >= 0) {
+            for (i=0; i<npx_count; i++) {
+              npx_obj.setPixelColor(i, cmd_buf[1], cmd_buf[2], cmd_buf[3]);
+            }
+            if (cmd == 0x06) npx_obj.show();
+        }
+        // 0x00 を返す
+        Wire.write(0x00);
+
+    } else if (cmd == 0x07 || cmd == 0x08) {
+        // NeoPixcel 5個まで色データを変更する(0x07 = データ書き換えだけ, 0x08 = 光らせる処理も実行)
+        if (npx_pin >= 0) {
+            c = cmd_buf[1]; // 送られてきたデータの数
+            if (c > 5) c = 5; // 最大で5個まで
+            f = cmd_buf[2]; // 書換え開始位置
+            p = 3; // 現在のコマンドバッファ読み込み位置
+            for (i=0; i<c; i++) {
+                npx_obj.setPixelColor(f+i, cmd_buf[p], cmd_buf[p+1], cmd_buf[p+2]);
+                p += 3;
+            }
+            if (cmd == 0x08) npx_obj.show();
+        }
+        // 0x00 を返す
+        Wire.write(0x00);
+      
+    } else if (cmd == 0x09) {
+        // NeoPixcel 現在のデータを LEDに送る
+        npx_obj.show();
+        // 0x00 を返す
+        Wire.write(0x00);
+        
     } else {
       // 不明なコマンドの場合は自分のアドレスをエコーする
       Wire.write(setting_data[0]);
@@ -285,7 +346,7 @@ void loop() {
 
   // ピン初期化
   for (i=0; i<16; i++) {
-    t = setting_data[i+2];
+    t = setting_data[i+3];
     if (t == 1) pinMode(pin_num[i], INPUT_PULLUP); // direct
     if (t == 2) pinMode(pin_num[i], OUTPUT); // col
     if (t == 3) pinMode(pin_num[i], INPUT_PULLUP); // row
@@ -319,7 +380,7 @@ void loop() {
   if (setting_data[1] == 1) {
     // ピン初期化
     for (i=0; i<16; i++) {
-      t = setting_data[i+2];
+      t = setting_data[i+3];
       if (t == 2) pinMode(pin_num[i], INPUT_PULLUP); // col
       if (t == 3) pinMode(pin_num[i], OUTPUT); // row
     }
